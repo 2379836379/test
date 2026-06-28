@@ -574,6 +574,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
 
     uint8_t *fetch_started = NULL;
     uint32_t *pull_mask = NULL;
+    uint64_t *fetch_sent_at = NULL;
     int32_t *local_sum = NULL;
     uint8_t *feature_cached = NULL;
     int32_t *feature_cache = NULL;
@@ -583,6 +584,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     if (op == OP_ALLREDUCE) {
         fetch_started = calloc(npkts, sizeof(uint8_t));
         pull_mask = calloc(npkts, sizeof(uint32_t));
+        fetch_sent_at = calloc(npkts, sizeof(uint64_t));
         local_sum = calloc(npkts * words_per_pkt, sizeof(int32_t));
         feature_cached = calloc((size_t)MAX_GROUP_SIZE * npkts, sizeof(uint8_t));
         feature_cache = calloc((size_t)MAX_GROUP_SIZE * npkts * words_per_pkt, sizeof(int32_t));
@@ -599,8 +601,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         }
     }
 
-    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !pull_mask || !local_sum || !feature_cached || !feature_cache || !rv))) {
-        free(recvd); free(fetch_started); free(pull_mask); free(local_sum); free(feature_cached); free(feature_cache);
+    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !pull_mask || !fetch_sent_at || !local_sum || !feature_cached || !feature_cache || !rv))) {
+        free(recvd); free(fetch_started); free(pull_mask); free(fetch_sent_at); free(local_sum); free(feature_cached); free(feature_cache);
         return -1;
     }
 
@@ -697,7 +699,21 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         }
 
         uint64_t now = now_us();
-        (void)last_fetch_at;
+        if (op == OP_ALLREDUCE && got < npkts && now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
+            for (uint32_t s = 0; s < npkts; s++) {
+                if (recvd[s]) continue;
+                if (fetch_sent_at[s] != 0 && now - fetch_sent_at[s] < RTO_US) continue;
+                uint32_t missing_mask = remote_mask & ~pull_mask[s];
+                for (int r = 0; r < g_n; r++) {
+                    if ((missing_mask & (1u << r)) == 0) continue;
+                    conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
+                    if (!peer) continue;
+                    conn_send_ex(peer, s, 0, op, 1, 1, NULL, 0);
+                }
+                fetch_sent_at[s] = now;
+            }
+            last_fetch_at = now;
+        }
         if (got >= npkts) {
             if (complete_at == 0) complete_at = now;
             else if (now - complete_at > 500000) break;
@@ -711,6 +727,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     free(recvd);
     free(fetch_started);
     free(pull_mask);
+    free(fetch_sent_at);
     free(local_sum);
     free(feature_cached);
     free(feature_cache);
@@ -747,6 +764,21 @@ static int           g_route_count = 0;
 static conn_ctx_t    g_conn_ctx[MAX_GROUP_SIZE];
 static int           g_group_n = 0;
 static agtr_t       *g_agtr = NULL;
+static int           g_drop_result_dst = -1;
+static int           g_drop_result_seq = -1;
+static int           g_drop_result_done = 0;
+
+static void init_fetch_test_fault(void) {
+    const char *spec = getenv("FETCH_TEST_DROP_RESULT");
+    int dst = -1;
+    int seq = -1;
+    if (!spec) return;
+    if (sscanf(spec, "%d:%d", &dst, &seq) == 2 && dst >= 0 && seq >= 0) {
+        g_drop_result_dst = dst;
+        g_drop_result_seq = seq;
+        g_drop_result_done = 0;
+    }
+}
 
 /* 路由器某端口抓包线程（已给） */
 static void *dev_capture_thread(void *arg) {
@@ -794,6 +826,7 @@ void init_router(config_entry_t *cfgs, int n) {
     pthread_mutex_init(&g_dev_buf.lock, NULL);
     init_default_neighbor_masks();
     try_load_neighbor_masks("graph.cfg");
+    init_fetch_test_fault();
 
     for (int i = 0; i < n && g_dev_count < MAX_GROUP_SIZE; i++) {
         const char *port = cfgs[i].router_iface;
@@ -868,11 +901,15 @@ static void broadcast_slot(uint32_t seq) {
     uint8_t frame[HDR_LEN + PAYLOAD_LEN];
     for (int dst_rank = 0; dst_rank < g_group_n; dst_rank++) {
         uint32_t dst_ip = g_cfg[dst_rank].host_ip;
+        if (!g_drop_result_done && g_drop_result_dst == dst_rank && g_drop_result_seq == (int)seq) {
+            g_drop_result_done = 1;
+            continue;
+        }
         /* Aggregated result packets are sent directly by destination identity.
          * The src_ip is router-local metadata only; delivery depends on dst_ip. */
         int len = build_frame_ex(frame, 0, dst_ip,
                                  (uint32_t)dst_rank, (uint32_t)dst_rank,
-                                 0, (uint16_t)(g_group_n > 0 ? g_group_n - 1 : 0),
+                                 0, (uint16_t)count_bits32(neighbor_mask_of((uint32_t)dst_rank)),
                                  seq, 0, 0, 0,
                                  a->payload, PAYLOAD_LEN);
         ((mtp_header_t *)(frame + sizeof(eth_header_t) + sizeof(ip_header_t)))->ecn = router_ecn_mark();
