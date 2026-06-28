@@ -192,8 +192,17 @@ static send_ctx_t *active_send_ctx(void) {
 }
 
 static void send_ack_to_neighbors(uint32_t seq, uint8_t op) {
+    send_ctx_t *sx = active_send_ctx();
+    uint32_t missing_mask = 0;
+
+    if (sx && sx->send_mask && seq < sx->npkts)
+        missing_mask = sx->peer_mask & ~sx->send_mask[seq];
+    else
+        missing_mask = (g_n >= 32) ? 0xffffffffu : ((1u << g_n) - 1);
+
     for (int r = 0; r < g_n; r++) {
         if (r == g_rank) continue;
+        if ((missing_mask & (1u << r)) == 0) continue;
         conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
         if (peer)
             conn_send(peer, seq, 1, op, NULL, 0);
@@ -557,8 +566,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                                 recvd[m.seq_num] = 1;
                                 got++;
                                 last_progress = now_us();
-                                send_ack_to_neighbors(m.seq_num, op);
                             }
+                            send_ack_to_neighbors(m.seq_num, op);
                         }
                     }
                     continue;
@@ -572,43 +581,17 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                     recvd[m.seq_num] = 1;
                     got++;
                     last_progress = now_us();
-                    if (op == OP_ALLREDUCE)
-                        send_ack_to_neighbors(m.seq_num, op);
                 }
-                if (op != OP_ALLREDUCE) {
+                if (op == OP_ALLREDUCE) {
+                    send_ack_to_neighbors(m.seq_num, op);
+                } else {
                     conn_send(&g_conns[ci], m.seq_num, 1, op, NULL, 0);
                 }
             }
         }
 
         uint64_t now = now_us();
-        if (op == OP_ALLREDUCE && got < npkts && now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
-            uint32_t target = npkts;
-            for (uint32_t s = 0; s < npkts; s++) {
-                if (!recvd[s]) {
-                    target = s;
-                    break;
-                }
-            }
-            if (target < npkts) {
-                if (!fetch_started[target]) {
-                    memcpy(&local_sum[target * (PAYLOAD_LEN / sizeof(int32_t))],
-                           g_local_src_buf + target * PAYLOAD_LEN,
-                           PAYLOAD_LEN);
-                    fetch_started[target] = 1;
-                }
-                uint32_t missing = remote_mask & ~recv_mask[target];
-                for (int r = 0; r < g_n; r++) {
-                    if ((missing & (1u << r)) == 0) continue;
-                    conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
-                    if (peer) {
-                        conn_send_ex(peer, target, 0, op, 1, 0, NULL, 0);
-                        break;
-                    }
-                }
-                last_fetch_at = now;
-            }
-        }
+        (void)last_fetch_at;
         if (got >= npkts) {
             if (complete_at == 0) complete_at = now;
             else if (now - complete_at > 500000) break;
