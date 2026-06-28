@@ -254,11 +254,10 @@ static recv_vertex_state_t *recv_state_of(uint32_t vertex_id) {
     return &g_recv_states[vertex_id];
 }
 
-static void mark_all_senders_ecn(void) {
-    for (int i = 0; i < MAX_GROUP_SIZE; i++) {
-        if (g_send_states[i].active)
-            g_send_states[i].ecn_pending = 1;
-    }
+static void mark_sender_ecn(uint32_t vertex_id) {
+    send_vertex_state_t *sv = send_state_of(vertex_id);
+    if (sv && sv->active)
+        sv->ecn_pending = 1;
 }
 
 static void send_ack_to_neighbors(uint32_t vertex_id, uint16_t block_id, uint8_t op) {
@@ -575,16 +574,19 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     uint8_t *fetch_started = NULL;
     uint32_t *pull_mask = NULL;
     uint64_t *fetch_sent_at = NULL;
+    uint32_t *neighbor_cached_pkts = NULL;
     int32_t *local_sum = NULL;
     uint8_t *feature_cached = NULL;
     int32_t *feature_cache = NULL;
     uint32_t remote_mask = 0;
     recv_vertex_state_t *rv = NULL;
+    uint8_t ack_sent = 0;
     int words_per_pkt = PAYLOAD_LEN / (int)sizeof(int32_t);
     if (op == OP_ALLREDUCE) {
         fetch_started = calloc(npkts, sizeof(uint8_t));
         pull_mask = calloc(npkts, sizeof(uint32_t));
         fetch_sent_at = calloc(npkts, sizeof(uint64_t));
+        neighbor_cached_pkts = calloc(MAX_GROUP_SIZE, sizeof(uint32_t));
         local_sum = calloc(npkts * words_per_pkt, sizeof(int32_t));
         feature_cached = calloc((size_t)MAX_GROUP_SIZE * npkts, sizeof(uint8_t));
         feature_cache = calloc((size_t)MAX_GROUP_SIZE * npkts * words_per_pkt, sizeof(int32_t));
@@ -601,8 +603,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         }
     }
 
-    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !pull_mask || !fetch_sent_at || !local_sum || !feature_cached || !feature_cache || !rv))) {
-        free(recvd); free(fetch_started); free(pull_mask); free(fetch_sent_at); free(local_sum); free(feature_cached); free(feature_cache);
+    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !pull_mask || !fetch_sent_at || !neighbor_cached_pkts || !local_sum || !feature_cached || !feature_cache || !rv))) {
+        free(recvd); free(fetch_started); free(pull_mask); free(fetch_sent_at); free(neighbor_cached_pkts); free(local_sum); free(feature_cached); free(feature_cache);
         return -1;
     }
 
@@ -613,7 +615,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
             while (conn_pop(&g_conns[ci], &m)) {
                 saw_pkt = 1;
                 if (m.ecn)
-                    mark_all_senders_ecn();
+                    mark_sender_ecn(m.dst_id);
                 if (m.is_ack == 1) {
                     send_vertex_state_t *sv = send_state_of(m.dst_id);
                     if (sv && sv->active &&
@@ -648,6 +650,9 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                     if (m.src_id < MAX_GROUP_SIZE && !feature_cached[cache_slot]) {
                         memcpy(&feature_cache[cache_slot * words_per_pkt], m.payload, PAYLOAD_LEN);
                         feature_cached[cache_slot] = 1;
+                        neighbor_cached_pkts[m.src_id]++;
+                        if (rv && neighbor_cached_pkts[m.src_id] == npkts && m.src_id < 32)
+                            rv->neighbor_recv_bitmap |= (1u << m.src_id);
                     }
                     if (!recvd[m.seq_num]) {
                         if (!fetch_started[m.seq_num]) {
@@ -663,8 +668,6 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                             for (int i = 0; i < words_per_pkt; i++)
                                 dst_words[i] += src_words[i];
                             pull_mask[m.seq_num] |= bit;
-                            if (rv && m.src_id < 32)
-                                rv->neighbor_recv_bitmap |= bit;
                             if (pull_mask[m.seq_num] == remote_mask) {
                                 memcpy((uint8_t *)buf + m.seq_num * PAYLOAD_LEN,
                                        dst_words, PAYLOAD_LEN);
@@ -685,13 +688,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                     last_progress = now_us();
                 }
                 if (op == OP_ALLREDUCE && is_complete_result) {
-                    /* A switch result is a complete aggregation result, unlike fetch replies.
-                     * Once seen, the per-vertex reception bitmap is satisfied and ACKs are sent only for this path. */
-                    if (rv && m.dst_id == rv->vertex_id && m.block_id == rv->block_id) {
+                    if (rv && m.dst_id == rv->vertex_id && m.block_id == rv->block_id)
                         rv->switch_result_seen = 1;
-                        rv->neighbor_recv_bitmap = rv->neighbor_mask;
-                    }
-                    send_ack_to_neighbors((uint32_t)g_rank, 0, op);
                 } else if (op != OP_ALLREDUCE) {
                     conn_send(&g_conns[ci], m.seq_num, 1, op, NULL, 0);
                 }
@@ -699,20 +697,28 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         }
 
         uint64_t now = now_us();
-        if (op == OP_ALLREDUCE && got < npkts && now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
-            for (uint32_t s = 0; s < npkts; s++) {
-                if (recvd[s]) continue;
-                if (fetch_sent_at[s] != 0 && now - fetch_sent_at[s] < RTO_US) continue;
-                uint32_t missing_mask = remote_mask & ~pull_mask[s];
-                for (int r = 0; r < g_n; r++) {
-                    if ((missing_mask & (1u << r)) == 0) continue;
-                    conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
-                    if (!peer) continue;
+        if (op == OP_ALLREDUCE && got < npkts && rv && !rv->switch_result_seen &&
+            now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
+            uint32_t missing_neighbors = rv->neighbor_mask & ~rv->neighbor_recv_bitmap;
+            for (int r = 0; r < g_n; r++) {
+                if ((missing_neighbors & (1u << r)) == 0) continue;
+                conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
+                if (!peer) continue;
+                for (uint32_t s = 0; s < npkts; s++) {
+                    size_t cache_slot = (size_t)r * npkts + s;
+                    if (recvd[s]) continue;
+                    if (feature_cached[cache_slot]) continue;
+                    if (fetch_sent_at[s] != 0 && now - fetch_sent_at[s] < RTO_US) continue;
                     conn_send_ex(peer, s, 0, op, 1, 1, NULL, 0);
+                    fetch_sent_at[s] = now;
                 }
-                fetch_sent_at[s] = now;
             }
             last_fetch_at = now;
+        }
+        if (op == OP_ALLREDUCE && got >= npkts && rv && !ack_sent) {
+            rv->neighbor_recv_bitmap = rv->neighbor_mask;
+            send_ack_to_neighbors((uint32_t)g_rank, 0, op);
+            ack_sent = 1;
         }
         if (got >= npkts) {
             if (complete_at == 0) complete_at = now;
@@ -728,6 +734,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     free(fetch_started);
     free(pull_mask);
     free(fetch_sent_at);
+    free(neighbor_cached_pkts);
     free(local_sum);
     free(feature_cached);
     free(feature_cache);
@@ -962,7 +969,10 @@ void INC(void) {
             continue;
         }
         if (mtp->is_fetch == 1) {
-            /* Fetch packets bypass switch aggregation in the simplified model. */
+            /* Paper semantics: pulled feature packets bypass aggregation and release the
+             * corresponding completed aggregator slot when they arrive at the switch. */
+            if (ntohs(ip->total_len) > (uint16_t)(ip_ihl + sizeof(mtp_header_t)))
+                clear_slot(ntohs(ip->id));
             mtp->ecn = router_ecn_mark();
             router_forward(pk.data, pk.len, ip->dst_ip);
             continue;
