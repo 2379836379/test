@@ -7,6 +7,10 @@
 #include <errno.h>
 #include <sys/time.h>
 
+#define ECN_RING_THRESHOLD ((DEV_RING_SIZE * 3) / 4)
+#define CC_GAP_STEP_US 5
+#define CC_GAP_MAX_US 2000
+
 /*======================================================================
  *  实验七：在网计算  —— 学生模板
  *
@@ -147,15 +151,55 @@ static pthread_mutex_t g_tx_lock = PTHREAD_MUTEX_INITIALIZER;
 static conn_t         g_conns[MAX_CONNS];
 static int            g_conn_count = 0;
 
+static conn_t *find_conn_by_remote(uint32_t remote_ip) {
+    for (int i = 0; i < g_conn_count; i++) {
+        if (!g_conns[i].in_use) continue;
+        if (g_conns[i].local_ip == g_my_ip && g_conns[i].remote_ip == remote_ip)
+            return &g_conns[i];
+    }
+    return NULL;
+}
+
 typedef struct {
     int active;
     const uint8_t *buf;
     uint32_t npkts;
     uint8_t op;
     uint8_t *acked;
+    uint32_t *send_mask;
+    uint32_t peer_mask;
+    volatile uint8_t ecn_pending;
+    uint32_t gap_us;
 } send_ctx_t;
 
 static send_ctx_t g_send_ctx[MAX_CONNS];
+static void conn_send(conn_t *cn, uint32_t seq, uint8_t ack_flag, uint8_t op,
+                      const void *payload, uint16_t plen);
+
+static void mark_all_senders_ecn(void) {
+    for (int i = 0; i < g_conn_count; i++) {
+        if (g_send_ctx[i].active)
+            g_send_ctx[i].ecn_pending = 1;
+    }
+}
+
+static send_ctx_t *active_send_ctx(void) {
+    for (int i = 0; i < g_conn_count; i++) {
+        if (g_send_ctx[i].active)
+            return &g_send_ctx[i];
+    }
+    return NULL;
+}
+
+static void send_ack_to_neighbors(uint32_t seq, uint8_t op) {
+    for (int r = 0; r < g_n; r++) {
+        if (r == g_rank) continue;
+        conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
+        if (peer)
+            conn_send(peer, seq, 1, op, NULL, 0);
+    }
+}
+
 static const uint8_t *g_local_src_buf = NULL;
 static uint32_t g_local_src_npkts = 0;
 static uint8_t g_local_src_op = 0;
@@ -231,10 +275,15 @@ static void *host_rx_thread(void *arg) {
         if (plen > PAYLOAD_LEN) plen = PAYLOAD_LEN;
         // 按本地连接上下文分发，不把 block_id 当作 conn_id 使用
         conn_t *cn = NULL;
-        for (int i = 0; i < g_conn_count; i++)
-            if (g_conns[i].in_use &&
-                g_conns[i].local_ip == ip->dst_ip &&
-                g_conns[i].remote_ip == ip->src_ip) { cn = &g_conns[i]; break; }
+        for (int i = 0; i < g_conn_count; i++) {
+            if (!g_conns[i].in_use) continue;
+            if (g_conns[i].local_ip != ip->dst_ip) continue;
+            if (g_conns[i].remote_ip == ip->src_ip ||
+                (ip->src_ip == 0 && g_conns[i].remote_ip == 0)) {
+                cn = &g_conns[i];
+                break;
+            }
+        }
         if (!cn) continue;
         // 放进该连接的接收队列
         pthread_mutex_lock(&cn->lock);
@@ -329,7 +378,6 @@ int init_conn(uint16_t conn_id, uint32_t local_ip, uint32_t remote_ip) {
 int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
     if (conn < 0 || conn >= g_conn_count) return -1;
     conn_t *cn = &g_conns[conn];
-
     uint32_t npkts = size / PAYLOAD_LEN;
     if (npkts == 0) return 0;
 
@@ -350,13 +398,19 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
      **********************/
     // 确认进度
     uint8_t *acked = calloc(npkts, sizeof(uint8_t));
+    uint32_t *send_mask = calloc(npkts, sizeof(uint32_t));
     // 上次发送时间
     uint64_t *sent_at = calloc(npkts, sizeof(uint64_t));
     // 发送窗口左边界
     uint32_t base = 0;
 
-    if (!acked || !sent_at) {
+    uint32_t peer_mask = 0;
+    for (int r = 0; r < g_n; r++)
+        if (r != g_rank) peer_mask |= (1u << r);
+
+    if (!acked || !send_mask || !sent_at) {
         free(acked);
+        free(send_mask);
         free(sent_at);
         return -1;
     }
@@ -366,30 +420,41 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
     g_send_ctx[conn].npkts = npkts;
     g_send_ctx[conn].op = op;
     g_send_ctx[conn].acked = acked;
+    g_send_ctx[conn].send_mask = send_mask;
+    g_send_ctx[conn].peer_mask = peer_mask;
+    g_send_ctx[conn].ecn_pending = 0;
+    g_send_ctx[conn].gap_us = 100;
+
+    uint64_t last_gap_adjust = now_us();
+    uint64_t last_tx_at = 0;
 
     while (base < npkts) {
-        rx_msg_t m;
-        // 从这条连接的接收队列里取一个消息
-        while (conn_pop(cn, &m)) {
-            if (m.is_ack == 1 && m.seq_num < npkts) {
-                acked[m.seq_num] = 1;
-            } else if (m.is_fetch == 1 && m.payload_len == 0 && m.seq_num < npkts) {
-                conn_send_ex(cn, m.seq_num, 0, op, 1, 1,
-                             (const uint8_t *)buf + m.seq_num * PAYLOAD_LEN, PAYLOAD_LEN);
-            }
+        uint64_t now = now_us();
+        if (g_send_ctx[conn].ecn_pending) {
+            uint32_t gap = g_send_ctx[conn].gap_us;
+            g_send_ctx[conn].gap_us = gap == 0 ? 1 : (gap * 2 > CC_GAP_MAX_US ? CC_GAP_MAX_US : gap * 2);
+            g_send_ctx[conn].ecn_pending = 0;
+            last_gap_adjust = now;
+        } else if (g_send_ctx[conn].gap_us > 0 && now - last_gap_adjust >= RTO_US) {
+            g_send_ctx[conn].gap_us = (g_send_ctx[conn].gap_us > CC_GAP_STEP_US) ?
+                                      (g_send_ctx[conn].gap_us - CC_GAP_STEP_US) : 0;
+            last_gap_adjust = now;
         }
         // 推进窗口
         while (base < npkts && acked[base]) base++;
         // 新窗口
-        uint64_t now = now_us();
         uint32_t end = base + WINDOW;
         if (end > npkts) end = npkts;
         for (uint32_t s = base; s < end; s++) {
-            if (!acked[s] && (sent_at[s] == 0 || now - sent_at[s] >= RTO_US)) {
+            uint64_t send_now = now_us();
+            if (g_send_ctx[conn].gap_us > 0 && last_tx_at != 0 && send_now - last_tx_at < g_send_ctx[conn].gap_us)
+                break;
+            if (!acked[s] && (sent_at[s] == 0 || send_now - sent_at[s] >= RTO_US)) {
                 uint8_t resend_flag = (sent_at[s] != 0);
                 conn_send_ex(cn, s, 0, op, 0, resend_flag,
                              (const uint8_t *)buf + s * PAYLOAD_LEN, PAYLOAD_LEN);
-                sent_at[s] = now;
+                sent_at[s] = send_now;
+                last_tx_at = send_now;
             }
         }
         if (base < npkts) usleep(200);
@@ -399,7 +464,12 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
     g_send_ctx[conn].buf = NULL;
     g_send_ctx[conn].npkts = 0;
     g_send_ctx[conn].acked = NULL;
+    g_send_ctx[conn].send_mask = NULL;
+    g_send_ctx[conn].peer_mask = 0;
+    g_send_ctx[conn].ecn_pending = 0;
+    g_send_ctx[conn].gap_us = 0;
     free(acked);
+    free(send_mask);
     free(sent_at);
     /***********************
      * end of your code
@@ -412,7 +482,6 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
  * 当前实现里，可靠传输序号来自本地解析出的 seq_num，而不是论文头字段 count。 */
 int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     if (conn < 0 || conn >= g_conn_count) return -1;
-    conn_t *cn = &g_conns[conn];
 
     uint32_t npkts = size / PAYLOAD_LEN;
     if (npkts == 0) return 0;
@@ -424,19 +493,19 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     uint64_t last_fetch_at = 0;
 
     uint8_t *fetch_started = NULL;
-    uint32_t *fetch_mask = NULL;
+    uint32_t *recv_mask = NULL;
     int32_t *local_sum = NULL;
     uint32_t remote_mask = 0;
     if (op == OP_ALLREDUCE) {
         fetch_started = calloc(npkts, sizeof(uint8_t));
-        fetch_mask = calloc(npkts, sizeof(uint32_t));
+        recv_mask = calloc(npkts, sizeof(uint32_t));
         local_sum = calloc(npkts * (PAYLOAD_LEN / sizeof(int32_t)), sizeof(int32_t));
         for (int r = 0; r < g_n; r++)
             if (r != g_rank) remote_mask |= (1u << r);
     }
 
-    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !fetch_mask || !local_sum))) {
-        free(recvd); free(fetch_started); free(fetch_mask); free(local_sum);
+    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !recv_mask || !local_sum))) {
+        free(recvd); free(fetch_started); free(recv_mask); free(local_sum);
         return -1;
     }
 
@@ -446,9 +515,15 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
             rx_msg_t m;
             while (conn_pop(&g_conns[ci], &m)) {
                 saw_pkt = 1;
+                if (m.ecn)
+                    mark_all_senders_ecn();
                 if (m.is_ack == 1) {
-                    if (g_send_ctx[ci].active && g_send_ctx[ci].acked && m.seq_num < g_send_ctx[ci].npkts)
-                        g_send_ctx[ci].acked[m.seq_num] = 1;
+                    send_ctx_t *sx = active_send_ctx();
+                    if (sx && sx->send_mask && m.seq_num < sx->npkts && m.src_id < 32) {
+                        sx->send_mask[m.seq_num] |= (1u << m.src_id);
+                        if (sx->send_mask[m.seq_num] == sx->peer_mask)
+                            sx->acked[m.seq_num] = 1;
+                    }
                     continue;
                 }
 
@@ -470,18 +545,19 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                             fetch_started[m.seq_num] = 1;
                         }
                         uint32_t bit = (m.src_id < 32) ? (1u << m.src_id) : 0;
-                        if (bit != 0 && (fetch_mask[m.seq_num] & bit) == 0) {
+                        if (bit != 0 && (recv_mask[m.seq_num] & bit) == 0) {
                             int32_t *dst_words = &local_sum[m.seq_num * (PAYLOAD_LEN / sizeof(int32_t))];
                             int32_t *src_words = (int32_t *)m.payload;
                             for (int i = 0; i < PAYLOAD_LEN / (int)sizeof(int32_t); i++)
                                 dst_words[i] += src_words[i];
-                            fetch_mask[m.seq_num] |= bit;
-                            if (fetch_mask[m.seq_num] == remote_mask) {
+                            recv_mask[m.seq_num] |= bit;
+                            if (recv_mask[m.seq_num] == remote_mask) {
                                 memcpy((uint8_t *)buf + m.seq_num * PAYLOAD_LEN,
                                        dst_words, PAYLOAD_LEN);
                                 recvd[m.seq_num] = 1;
                                 got++;
                                 last_progress = now_us();
+                                send_ack_to_neighbors(m.seq_num, op);
                             }
                         }
                     }
@@ -491,31 +567,47 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                 if (!recvd[m.seq_num]) {
                     memcpy((uint8_t *)buf + m.seq_num * PAYLOAD_LEN,
                            m.payload, PAYLOAD_LEN);
+                    if (op == OP_ALLREDUCE)
+                        recv_mask[m.seq_num] = remote_mask;
                     recvd[m.seq_num] = 1;
                     got++;
                     last_progress = now_us();
+                    if (op == OP_ALLREDUCE)
+                        send_ack_to_neighbors(m.seq_num, op);
                 }
-                conn_send(&g_conns[ci], m.seq_num, 1, op, NULL, 0);
+                if (op != OP_ALLREDUCE) {
+                    conn_send(&g_conns[ci], m.seq_num, 1, op, NULL, 0);
+                }
             }
         }
 
         uint64_t now = now_us();
         if (op == OP_ALLREDUCE && got < npkts && now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
+            uint32_t target = npkts;
             for (uint32_t s = 0; s < npkts; s++) {
                 if (!recvd[s]) {
-                    if (!fetch_started[s]) {
-                        memcpy(&local_sum[s * (PAYLOAD_LEN / sizeof(int32_t))],
-                               g_local_src_buf + s * PAYLOAD_LEN,
-                               PAYLOAD_LEN);
-                        fetch_started[s] = 1;
-                    }
-                    for (int ci = 0; ci < g_conn_count; ci++) {
-                        if (g_conns[ci].in_use)
-                            conn_send_ex(&g_conns[ci], s, 0, op, 1, 0, NULL, 0);
-                    }
+                    target = s;
+                    break;
                 }
             }
-            last_fetch_at = now;
+            if (target < npkts) {
+                if (!fetch_started[target]) {
+                    memcpy(&local_sum[target * (PAYLOAD_LEN / sizeof(int32_t))],
+                           g_local_src_buf + target * PAYLOAD_LEN,
+                           PAYLOAD_LEN);
+                    fetch_started[target] = 1;
+                }
+                uint32_t missing = remote_mask & ~recv_mask[target];
+                for (int r = 0; r < g_n; r++) {
+                    if ((missing & (1u << r)) == 0) continue;
+                    conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
+                    if (peer) {
+                        conn_send_ex(peer, target, 0, op, 1, 0, NULL, 0);
+                        break;
+                    }
+                }
+                last_fetch_at = now;
+            }
         }
         if (got >= npkts) {
             if (complete_at == 0) complete_at = now;
@@ -527,7 +619,7 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
 
     free(recvd);
     free(fetch_started);
-    free(fetch_mask);
+    free(recv_mask);
     free(local_sum);
     return (int)size;
 }
@@ -663,6 +755,18 @@ static int dev_pop(dev_pkt_t *out) {
     return ok;
 }
 
+
+static uint8_t router_ecn_mark(void) {
+    uint8_t ecn = 0;
+    pthread_mutex_lock(&g_dev_buf.lock);
+    int used = g_dev_buf.head - g_dev_buf.tail;
+    if (used < 0) used += DEV_RING_SIZE;
+    if (used >= ECN_RING_THRESHOLD)
+        ecn = 1;
+    pthread_mutex_unlock(&g_dev_buf.lock);
+    return ecn;
+}
+
 /* 把某个已聚合完成的 slot 广播给所有连接（取模寻址）。已给。 */
 static void broadcast_slot(uint32_t seq) {
     agtr_t *a = &g_agtr[seq % AGTR_ARRAY_SIZE];
@@ -676,6 +780,7 @@ static void broadcast_slot(uint32_t seq) {
                                  0, (uint16_t)(g_group_n > 0 ? g_group_n - 1 : 0),
                                  seq, 0, 0, 0,
                                  a->payload, PAYLOAD_LEN);
+        ((mtp_header_t *)(frame + sizeof(eth_header_t) + sizeof(ip_header_t)))->ecn = router_ecn_mark();
         router_forward(frame, len, dst_ip);
     }
 }
@@ -720,11 +825,13 @@ void INC(void) {
          *  5. One payload per rank is accumulated into the slot indexed by transport seq.
          **********************/
         if (mtp->is_ack == 1) {
+            mtp->ecn = router_ecn_mark();
             router_forward(pk.data, pk.len, ip->dst_ip);
             continue;
         }
         if (mtp->is_fetch == 1) {
             /* Fetch packets bypass switch aggregation in the simplified model. */
+            mtp->ecn = router_ecn_mark();
             router_forward(pk.data, pk.len, ip->dst_ip);
             continue;
         }

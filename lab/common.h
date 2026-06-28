@@ -96,14 +96,14 @@ typedef struct {
     int       index;
 } net_device_t;
 
-#define DEV_BUF_SIZE 2048
+#define DEV_BUF_SIZE 4096
 typedef struct {
     net_device_t *device;
     uint8_t       data[DEV_BUF_SIZE];
     uint32_t      len;
 } dev_pkt_t;
 
-#define DEV_RING_SIZE 16384
+#define DEV_RING_SIZE 65536
 typedef struct {
     dev_pkt_t       packets[DEV_RING_SIZE];
     volatile int    head;

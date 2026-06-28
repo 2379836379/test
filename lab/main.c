@@ -10,7 +10,7 @@
  *
  *  仅保留在网聚合功能：
  *    - router 端运行 INC()
- *    - host 端按环形发送本地数据，并从前驱接收交换机广播回来的聚合结果
+ *    - host 端上传本地顶点特征，并接收交换机聚合结果
  *
  *  用法：./inc <name> <config> allreduce
  *====================================================================*/
@@ -129,11 +129,25 @@ int main(int argc, char *argv[]) {
     read_input(rank, src, nints);
 
     int succ = (rank + 1) % n;
-    int pred = (rank - 1 + n) % n;
 
     int send_conn = init_conn((uint16_t)rank, ip_of_rank(rank), ip_of_rank(succ));
-    int recv_conn = init_conn((uint16_t)pred, ip_of_rank(rank), ip_of_rank(pred));
-    if (send_conn < 0 || recv_conn < 0) {
+    if (send_conn < 0) {
+        fprintf(stderr, "init_conn failed\n");
+        free(src);
+        free(dst);
+        return 1;
+    }
+    for (int r = 0; r < n; r++) {
+        if (r == rank || r == succ) continue;
+        if (init_conn((uint16_t)r, ip_of_rank(rank), ip_of_rank(r)) < 0) {
+            fprintf(stderr, "init_conn failed\n");
+            free(src);
+            free(dst);
+            return 1;
+        }
+    }
+    int recv_conn = init_conn(0xffffu, ip_of_rank(rank), 0);
+    if (recv_conn < 0) {
         fprintf(stderr, "init_conn failed\n");
         free(src);
         free(dst);
