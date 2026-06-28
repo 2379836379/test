@@ -37,6 +37,8 @@
 
 static int g_n = 0;
 static int rank_of_ip(uint32_t ip);
+static int count_bits32(uint32_t x);
+static uint32_t neighbor_mask_of(uint32_t vertex_id);
 
 uint64_t now_us(void) {
     struct timeval tv;
@@ -109,7 +111,9 @@ static int build_frame(uint8_t *buf,
     (void)op;
     int src_rank = rank_of_ip(src_ip);
     int dst_rank = rank_of_ip(dst_ip);
-    uint16_t count = (uint16_t)(is_ack ? 0 : (g_n > 0 ? g_n - 1 : 0));
+    uint16_t count = 0;
+    if (!is_ack && src_rank >= 0)
+        count = (uint16_t)count_bits32(neighbor_mask_of((uint32_t)src_rank));
     return build_frame_ex(buf, src_ip, dst_ip,
                           (uint32_t)(src_rank >= 0 ? src_rank : 0),
                           (uint32_t)(dst_rank >= 0 ? dst_rank : 0),
@@ -150,6 +154,57 @@ static pthread_mutex_t g_tx_lock = PTHREAD_MUTEX_INITIALIZER;
 //    - lock：保护这条连接队列的锁
 static conn_t         g_conns[MAX_CONNS];
 static int            g_conn_count = 0;
+static uint32_t       g_neighbor_masks[MAX_GROUP_SIZE];
+
+static uint32_t default_neighbor_mask(int rank) {
+    uint32_t mask = 0;
+    for (int r = 0; r < g_n; r++)
+        if (r != rank) mask |= (1u << r);
+    return mask;
+}
+
+static int count_bits32(uint32_t x) {
+    int n = 0;
+    while (x) {
+        x &= (x - 1);
+        n++;
+    }
+    return n;
+}
+
+static uint32_t neighbor_mask_of(uint32_t vertex_id) {
+    if (vertex_id >= (uint32_t)g_n) return 0;
+    return g_neighbor_masks[vertex_id];
+}
+
+static void init_default_neighbor_masks(void) {
+    for (int r = 0; r < g_n; r++)
+        g_neighbor_masks[r] = default_neighbor_mask(r);
+}
+
+static void try_load_neighbor_masks(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char *save = NULL;
+        char *tok = strtok_r(line, ", \t\r\n", &save);
+        if (!tok) continue;
+        int vertex = atoi(tok);
+        if (vertex < 0 || vertex >= g_n) continue;
+
+        uint32_t mask = 0;
+        while ((tok = strtok_r(NULL, ", \t\r\n", &save)) != NULL) {
+            int nbr = atoi(tok);
+            if (nbr >= 0 && nbr < g_n && nbr != vertex)
+                mask |= (1u << nbr);
+        }
+        g_neighbor_masks[vertex] = mask;
+    }
+    fclose(fp);
+}
 
 static conn_t *find_conn_by_remote(uint32_t remote_ip) {
     for (int i = 0; i < g_conn_count; i++) {
@@ -165,47 +220,61 @@ typedef struct {
     const uint8_t *buf;
     uint32_t npkts;
     uint8_t op;
-    uint8_t *acked;
-    uint32_t *send_mask;
-    uint32_t peer_mask;
+    uint8_t *seq_acked;
+    uint32_t neighbor_ack_bitmap;
+    uint32_t neighbor_mask;
+    uint32_t vertex_id;
+    uint16_t block_id;
     volatile uint8_t ecn_pending;
     uint32_t gap_us;
-} send_ctx_t;
+} send_vertex_state_t;
 
-static send_ctx_t g_send_ctx[MAX_CONNS];
+typedef struct {
+    int active;
+    uint32_t vertex_id;
+    uint16_t block_id;
+    uint32_t neighbor_recv_bitmap;
+    uint32_t neighbor_mask;
+    uint8_t switch_result_seen;
+} recv_vertex_state_t;
+
+static send_vertex_state_t g_send_states[MAX_GROUP_SIZE];
+static recv_vertex_state_t g_recv_states[MAX_GROUP_SIZE];
 static void conn_send(conn_t *cn, uint32_t seq, uint8_t ack_flag, uint8_t op,
                       const void *payload, uint16_t plen);
+static void host_inject(uint8_t *frame, int len);
+
+static send_vertex_state_t *send_state_of(uint32_t vertex_id) {
+    if (vertex_id >= MAX_GROUP_SIZE) return NULL;
+    return &g_send_states[vertex_id];
+}
+
+static recv_vertex_state_t *recv_state_of(uint32_t vertex_id) {
+    if (vertex_id >= MAX_GROUP_SIZE) return NULL;
+    return &g_recv_states[vertex_id];
+}
 
 static void mark_all_senders_ecn(void) {
-    for (int i = 0; i < g_conn_count; i++) {
-        if (g_send_ctx[i].active)
-            g_send_ctx[i].ecn_pending = 1;
+    for (int i = 0; i < MAX_GROUP_SIZE; i++) {
+        if (g_send_states[i].active)
+            g_send_states[i].ecn_pending = 1;
     }
 }
 
-static send_ctx_t *active_send_ctx(void) {
-    for (int i = 0; i < g_conn_count; i++) {
-        if (g_send_ctx[i].active)
-            return &g_send_ctx[i];
-    }
-    return NULL;
-}
-
-static void send_ack_to_neighbors(uint32_t seq, uint8_t op) {
-    send_ctx_t *sx = active_send_ctx();
-    uint32_t missing_mask = 0;
-
-    if (sx && sx->send_mask && seq < sx->npkts)
-        missing_mask = sx->peer_mask & ~sx->send_mask[seq];
-    else
-        missing_mask = (g_n >= 32) ? 0xffffffffu : ((1u << g_n) - 1);
-
+static void send_ack_to_neighbors(uint32_t vertex_id, uint16_t block_id, uint8_t op) {
+    (void)op;
+    uint32_t nbr_mask = neighbor_mask_of(vertex_id);
     for (int r = 0; r < g_n; r++) {
-        if (r == g_rank) continue;
-        if ((missing_mask & (1u << r)) == 0) continue;
+        if ((nbr_mask & (1u << r)) == 0) continue;
         conn_t *peer = find_conn_by_remote(g_cfg[r].host_ip);
-        if (peer)
-            conn_send(peer, seq, 1, op, NULL, 0);
+        if (!peer) continue;
+
+        uint8_t frame[HDR_LEN];
+        int len = build_frame_ex(frame, peer->local_ip, peer->remote_ip,
+                                 (uint32_t)g_rank, (uint32_t)r,
+                                 block_id, 0, 0,
+                                 1, 0, 0, NULL, 0);
+        host_inject(frame, len);
     }
 }
 
@@ -241,7 +310,9 @@ static void conn_send_ex(conn_t *cn, uint32_t seq, uint8_t ack_flag, uint8_t op,
     uint8_t frame[HDR_LEN + PAYLOAD_LEN];
     int src_rank = rank_of_ip(cn->local_ip);
     int dst_rank = rank_of_ip(cn->remote_ip);
-    uint16_t count = (uint16_t)(ack_flag ? 0 : (g_n > 0 ? g_n - 1 : 0));
+    uint16_t count = 0;
+    if (!ack_flag && src_rank >= 0)
+        count = (uint16_t)count_bits32(neighbor_mask_of((uint32_t)src_rank));
     int len = build_frame_ex(frame, cn->local_ip, cn->remote_ip,
                              (uint32_t)(src_rank >= 0 ? src_rank : 0),
                              (uint32_t)(dst_rank >= 0 ? dst_rank : 0),
@@ -354,6 +425,9 @@ void init_host(config_entry_t *cfgs, int n, const char *host_name) {
     for (int i = 0; i < n; i++)
         if (cfgs[i].rank == g_rank) iface = cfgs[i].host_iface;
 
+    init_default_neighbor_masks();
+    try_load_neighbor_masks("graph.cfg");
+
     g_host_handle = pcap_open_live(iface, DEV_BUF_SIZE, 1, 1, errbuf);
     if (!g_host_handle) {
         fprintf(stderr, "pcap_open_live(%s) failed: %s\n", iface, errbuf);
@@ -407,46 +481,51 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
      **********************/
     // 确认进度
     uint8_t *acked = calloc(npkts, sizeof(uint8_t));
-    uint32_t *send_mask = calloc(npkts, sizeof(uint32_t));
     // 上次发送时间
     uint64_t *sent_at = calloc(npkts, sizeof(uint64_t));
     // 发送窗口左边界
     uint32_t base = 0;
 
-    uint32_t peer_mask = 0;
-    for (int r = 0; r < g_n; r++)
-        if (r != g_rank) peer_mask |= (1u << r);
+    uint32_t peer_mask = neighbor_mask_of((uint32_t)g_rank);
 
-    if (!acked || !send_mask || !sent_at) {
+    if (!acked || !sent_at) {
         free(acked);
-        free(send_mask);
         free(sent_at);
         return -1;
     }
 
-    g_send_ctx[conn].active = 1;
-    g_send_ctx[conn].buf = (const uint8_t *)buf;
-    g_send_ctx[conn].npkts = npkts;
-    g_send_ctx[conn].op = op;
-    g_send_ctx[conn].acked = acked;
-    g_send_ctx[conn].send_mask = send_mask;
-    g_send_ctx[conn].peer_mask = peer_mask;
-    g_send_ctx[conn].ecn_pending = 0;
-    g_send_ctx[conn].gap_us = 100;
+    send_vertex_state_t *sv = send_state_of((uint32_t)g_rank);
+    if (!sv) {
+        free(acked);
+        free(sent_at);
+        return -1;
+    }
+    memset(sv, 0, sizeof(*sv));
+    sv->active = 1;
+    sv->buf = (const uint8_t *)buf;
+    sv->npkts = npkts;
+    sv->op = op;
+    sv->seq_acked = acked;
+    sv->neighbor_ack_bitmap = 0;
+    sv->neighbor_mask = peer_mask;
+    sv->vertex_id = (uint32_t)g_rank;
+    sv->block_id = 0;
+    sv->ecn_pending = 0;
+    sv->gap_us = 100;
 
     uint64_t last_gap_adjust = now_us();
     uint64_t last_tx_at = 0;
 
-    while (base < npkts) {
+    while (base < npkts || sv->neighbor_ack_bitmap != sv->neighbor_mask) {
         uint64_t now = now_us();
-        if (g_send_ctx[conn].ecn_pending) {
-            uint32_t gap = g_send_ctx[conn].gap_us;
-            g_send_ctx[conn].gap_us = gap == 0 ? 1 : (gap * 2 > CC_GAP_MAX_US ? CC_GAP_MAX_US : gap * 2);
-            g_send_ctx[conn].ecn_pending = 0;
+        if (sv->ecn_pending) {
+            uint32_t gap = sv->gap_us;
+            sv->gap_us = gap == 0 ? 1 : (gap * 2 > CC_GAP_MAX_US ? CC_GAP_MAX_US : gap * 2);
+            sv->ecn_pending = 0;
             last_gap_adjust = now;
-        } else if (g_send_ctx[conn].gap_us > 0 && now - last_gap_adjust >= RTO_US) {
-            g_send_ctx[conn].gap_us = (g_send_ctx[conn].gap_us > CC_GAP_STEP_US) ?
-                                      (g_send_ctx[conn].gap_us - CC_GAP_STEP_US) : 0;
+        } else if (sv->gap_us > 0 && now - last_gap_adjust >= RTO_US) {
+            sv->gap_us = (sv->gap_us > CC_GAP_STEP_US) ?
+                         (sv->gap_us - CC_GAP_STEP_US) : 0;
             last_gap_adjust = now;
         }
         // 推进窗口
@@ -456,7 +535,7 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
         if (end > npkts) end = npkts;
         for (uint32_t s = base; s < end; s++) {
             uint64_t send_now = now_us();
-            if (g_send_ctx[conn].gap_us > 0 && last_tx_at != 0 && send_now - last_tx_at < g_send_ctx[conn].gap_us)
+            if (sv->gap_us > 0 && last_tx_at != 0 && send_now - last_tx_at < sv->gap_us)
                 break;
             if (!acked[s] && (sent_at[s] == 0 || send_now - sent_at[s] >= RTO_US)) {
                 uint8_t resend_flag = (sent_at[s] != 0);
@@ -469,16 +548,8 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
         if (base < npkts) usleep(200);
     }
 
-    g_send_ctx[conn].active = 0;
-    g_send_ctx[conn].buf = NULL;
-    g_send_ctx[conn].npkts = 0;
-    g_send_ctx[conn].acked = NULL;
-    g_send_ctx[conn].send_mask = NULL;
-    g_send_ctx[conn].peer_mask = 0;
-    g_send_ctx[conn].ecn_pending = 0;
-    g_send_ctx[conn].gap_us = 0;
+    memset(sv, 0, sizeof(*sv));
     free(acked);
-    free(send_mask);
     free(sent_at);
     /***********************
      * end of your code
@@ -502,19 +573,34 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     uint64_t last_fetch_at = 0;
 
     uint8_t *fetch_started = NULL;
-    uint32_t *recv_mask = NULL;
+    uint32_t *pull_mask = NULL;
     int32_t *local_sum = NULL;
+    uint8_t *feature_cached = NULL;
+    int32_t *feature_cache = NULL;
     uint32_t remote_mask = 0;
+    recv_vertex_state_t *rv = NULL;
+    int words_per_pkt = PAYLOAD_LEN / (int)sizeof(int32_t);
     if (op == OP_ALLREDUCE) {
         fetch_started = calloc(npkts, sizeof(uint8_t));
-        recv_mask = calloc(npkts, sizeof(uint32_t));
-        local_sum = calloc(npkts * (PAYLOAD_LEN / sizeof(int32_t)), sizeof(int32_t));
-        for (int r = 0; r < g_n; r++)
-            if (r != g_rank) remote_mask |= (1u << r);
+        pull_mask = calloc(npkts, sizeof(uint32_t));
+        local_sum = calloc(npkts * words_per_pkt, sizeof(int32_t));
+        feature_cached = calloc((size_t)MAX_GROUP_SIZE * npkts, sizeof(uint8_t));
+        feature_cache = calloc((size_t)MAX_GROUP_SIZE * npkts * words_per_pkt, sizeof(int32_t));
+        remote_mask = neighbor_mask_of((uint32_t)g_rank);
+        rv = recv_state_of((uint32_t)g_rank);
+        if (rv) {
+            memset(rv, 0, sizeof(*rv));
+            rv->active = 1;
+            rv->vertex_id = (uint32_t)g_rank;
+            rv->block_id = 0;
+            rv->neighbor_mask = remote_mask;
+            rv->neighbor_recv_bitmap = 0;
+            rv->switch_result_seen = 0;
+        }
     }
 
-    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !recv_mask || !local_sum))) {
-        free(recvd); free(fetch_started); free(recv_mask); free(local_sum);
+    if (!recvd || (op == OP_ALLREDUCE && (!fetch_started || !pull_mask || !local_sum || !feature_cached || !feature_cache || !rv))) {
+        free(recvd); free(fetch_started); free(pull_mask); free(local_sum); free(feature_cached); free(feature_cache);
         return -1;
     }
 
@@ -527,11 +613,11 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                 if (m.ecn)
                     mark_all_senders_ecn();
                 if (m.is_ack == 1) {
-                    send_ctx_t *sx = active_send_ctx();
-                    if (sx && sx->send_mask && m.seq_num < sx->npkts && m.src_id < 32) {
-                        sx->send_mask[m.seq_num] |= (1u << m.src_id);
-                        if (sx->send_mask[m.seq_num] == sx->peer_mask)
-                            sx->acked[m.seq_num] = 1;
+                    send_vertex_state_t *sv = send_state_of(m.dst_id);
+                    if (sv && sv->active &&
+                        m.block_id == sv->block_id &&
+                        m.src_id < 32) {
+                        sv->neighbor_ack_bitmap |= (1u << m.src_id);
                     }
                     continue;
                 }
@@ -545,29 +631,45 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
 
                 if (m.payload_len == 0 || m.seq_num >= npkts) continue;
 
-                if (op == OP_ALLREDUCE && m.is_fetch == 1) {
+                conn_t *src_cn = &g_conns[ci];
+                int is_complete_result = (src_cn->remote_ip == 0 && m.is_fetch == 0);
+                int is_non_aggregated_feature = (op == OP_ALLREDUCE && m.is_fetch == 1 && src_cn->remote_ip != 0);
+
+                if (is_complete_result) {
+                    send_vertex_state_t *sv = send_state_of(m.dst_id);
+                    if (sv && sv->active && m.seq_num < sv->npkts)
+                        sv->seq_acked[m.seq_num] = 1;
+                }
+
+                if (is_non_aggregated_feature) {
+                    size_t cache_slot = (size_t)m.src_id * npkts + m.seq_num;
+                    if (m.src_id < MAX_GROUP_SIZE && !feature_cached[cache_slot]) {
+                        memcpy(&feature_cache[cache_slot * words_per_pkt], m.payload, PAYLOAD_LEN);
+                        feature_cached[cache_slot] = 1;
+                    }
                     if (!recvd[m.seq_num]) {
                         if (!fetch_started[m.seq_num]) {
-                            memcpy(&local_sum[m.seq_num * (PAYLOAD_LEN / sizeof(int32_t))],
+                            memcpy(&local_sum[m.seq_num * words_per_pkt],
                                    g_local_src_buf + m.seq_num * PAYLOAD_LEN,
                                    PAYLOAD_LEN);
                             fetch_started[m.seq_num] = 1;
                         }
                         uint32_t bit = (m.src_id < 32) ? (1u << m.src_id) : 0;
-                        if (bit != 0 && (recv_mask[m.seq_num] & bit) == 0) {
-                            int32_t *dst_words = &local_sum[m.seq_num * (PAYLOAD_LEN / sizeof(int32_t))];
-                            int32_t *src_words = (int32_t *)m.payload;
-                            for (int i = 0; i < PAYLOAD_LEN / (int)sizeof(int32_t); i++)
+                        if (bit != 0 && (pull_mask[m.seq_num] & bit) == 0) {
+                            int32_t *dst_words = &local_sum[m.seq_num * words_per_pkt];
+                            int32_t *src_words = &feature_cache[cache_slot * words_per_pkt];
+                            for (int i = 0; i < words_per_pkt; i++)
                                 dst_words[i] += src_words[i];
-                            recv_mask[m.seq_num] |= bit;
-                            if (recv_mask[m.seq_num] == remote_mask) {
+                            pull_mask[m.seq_num] |= bit;
+                            if (rv && m.src_id < 32)
+                                rv->neighbor_recv_bitmap |= bit;
+                            if (pull_mask[m.seq_num] == remote_mask) {
                                 memcpy((uint8_t *)buf + m.seq_num * PAYLOAD_LEN,
                                        dst_words, PAYLOAD_LEN);
                                 recvd[m.seq_num] = 1;
                                 got++;
                                 last_progress = now_us();
                             }
-                            send_ack_to_neighbors(m.seq_num, op);
                         }
                     }
                     continue;
@@ -576,15 +678,19 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                 if (!recvd[m.seq_num]) {
                     memcpy((uint8_t *)buf + m.seq_num * PAYLOAD_LEN,
                            m.payload, PAYLOAD_LEN);
-                    if (op == OP_ALLREDUCE)
-                        recv_mask[m.seq_num] = remote_mask;
                     recvd[m.seq_num] = 1;
                     got++;
                     last_progress = now_us();
                 }
-                if (op == OP_ALLREDUCE) {
-                    send_ack_to_neighbors(m.seq_num, op);
-                } else {
+                if (op == OP_ALLREDUCE && is_complete_result) {
+                    /* A switch result is a complete aggregation result, unlike fetch replies.
+                     * Once seen, the per-vertex reception bitmap is satisfied and ACKs are sent only for this path. */
+                    if (rv && m.dst_id == rv->vertex_id && m.block_id == rv->block_id) {
+                        rv->switch_result_seen = 1;
+                        rv->neighbor_recv_bitmap = rv->neighbor_mask;
+                    }
+                    send_ack_to_neighbors((uint32_t)g_rank, 0, op);
+                } else if (op != OP_ALLREDUCE) {
                     conn_send(&g_conns[ci], m.seq_num, 1, op, NULL, 0);
                 }
             }
@@ -600,10 +706,14 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         if (!saw_pkt) usleep(200);
     }
 
+    if (rv)
+        memset(rv, 0, sizeof(*rv));
     free(recvd);
     free(fetch_started);
-    free(recv_mask);
+    free(pull_mask);
     free(local_sum);
+    free(feature_cached);
+    free(feature_cache);
     return (int)size;
 }
 
@@ -682,6 +792,8 @@ void init_router(config_entry_t *cfgs, int n) {
     memcpy(g_cfg, cfgs, sizeof(config_entry_t) * n);
     memset(&g_dev_buf, 0, sizeof(g_dev_buf));
     pthread_mutex_init(&g_dev_buf.lock, NULL);
+    init_default_neighbor_masks();
+    try_load_neighbor_masks("graph.cfg");
 
     for (int i = 0; i < n && g_dev_count < MAX_GROUP_SIZE; i++) {
         const char *port = cfgs[i].router_iface;
@@ -824,10 +936,12 @@ void INC(void) {
         uint32_t dst_id = ntohl(mtp->dst_id);
         uint32_t expected_count = ntohs(mtp->count);
         uint32_t seq = ntohs(ip->id);
+        uint32_t required_count;
         (void)dst_id;
 
         if (src_id >= (uint32_t)g_group_n) continue;
-        if (expected_count != (uint32_t)(g_group_n - 1)) continue;
+        required_count = (uint32_t)count_bits32(neighbor_mask_of(src_id));
+        if (expected_count != required_count) continue;
 
         uint16_t k = (uint16_t)src_id;
         agtr_t *a = &g_agtr[seq % AGTR_ARRAY_SIZE];

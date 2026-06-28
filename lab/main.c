@@ -15,7 +15,7 @@
  *  用法：./inc <name> <config> allreduce
  *====================================================================*/
 
-#define MSG_SIZE (64 * 1024)
+#define MSG_SIZE (1024 * 1024)
 
 static config_entry_t cfgs[MAX_GROUP_SIZE];
 static int n = 0;
