@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -O2
 LDFLAGS = -lpcap -lpthread
 TARGET  = inc
-SRCS    = main.c lab.c
+SRCS    = main.c lab.c host.c router.c
 OBJS    = $(SRCS:.c=.o)
 CFG     = ranks.cfg
 HOSTS   = host1 host2 host3 host4

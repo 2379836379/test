@@ -54,7 +54,7 @@ typedef struct {
 } __attribute__((packed)) mtp_header_t;
 
 #define HDR_LEN (sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(mtp_header_t))
-// worker
+
 typedef struct {
     int      rank;
     char     host_name[32];
@@ -127,6 +127,18 @@ typedef struct {
     uint32_t bitmap;
     int32_t  payload[PAYLOAD_LEN / sizeof(int32_t)];
 } agtr_t;
+
+void common_set_group(config_entry_t *cfgs, int n);
+int rank_of_ip(uint32_t ip);
+int count_bits32(uint32_t x);
+uint32_t neighbor_mask_of(uint32_t vertex_id);
+int build_frame_ex(uint8_t *buf,
+                   uint32_t src_ip, uint32_t dst_ip,
+                   uint32_t src_id, uint32_t dst_id,
+                   uint16_t block_id, uint16_t count,
+                   uint32_t seq_for_transport,
+                   uint8_t is_ack, uint8_t is_fetch, uint8_t resend,
+                   const void *payload, uint16_t plen);
 
 void init_host(config_entry_t *cfgs, int n, const char *host_name);
 int  init_conn(uint16_t conn_id, uint32_t local_ip, uint32_t remote_ip);
