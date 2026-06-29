@@ -20,6 +20,8 @@ static agtr_t       *g_agtr = NULL;
 static int           g_drop_result_dst = -1;
 static int           g_drop_result_seq = -1;
 static int           g_drop_result_done = 0;
+static uint16_t      g_current_block = 0;
+static uint32_t      g_block_done_bitmap = 0;
 
 static void init_fetch_test_fault(void) {
     const char *spec = getenv("FETCH_TEST_DROP_RESULT");
@@ -68,6 +70,18 @@ static void router_forward(const uint8_t *frame, int len, uint32_t dst_ip) {
         }
 }
 
+static void broadcast_block_release(uint16_t next_block_id) {
+    uint8_t frame[HDR_LEN];
+    for (int dst_rank = 0; dst_rank < g_group_n; dst_rank++) {
+        uint32_t dst_ip = g_cfg[dst_rank].host_ip;
+        int len = build_frame_ex(frame, 0, dst_ip,
+                                 0, (uint32_t)dst_rank,
+                                 next_block_id, 0, 0,
+                                 1, 1, 0, NULL, 0);
+        router_forward(frame, len, dst_ip);
+    }
+}
+
 void init_router(config_entry_t *cfgs, int n) {
     char errbuf[PCAP_ERRBUF_SIZE];
     g_n = n;
@@ -76,6 +90,8 @@ void init_router(config_entry_t *cfgs, int n) {
     pthread_mutex_init(&g_dev_buf.lock, NULL);
     common_set_group(cfgs, n);
     init_fetch_test_fault();
+    g_current_block = 0;
+    g_block_done_bitmap = 0;
 
     for (int i = 0; i < n && g_dev_count < MAX_GROUP_SIZE; i++) {
         const char *port = cfgs[i].router_iface;
@@ -114,8 +130,8 @@ void init_router(config_entry_t *cfgs, int n) {
 
     g_agtr = calloc(AGTR_ARRAY_SIZE, sizeof(agtr_t));
     if (!g_agtr) { fprintf(stderr, "agtr alloc failed\n"); exit(1); }
-    printf("[router] opened %d ports, group_n=%d, agtr_slots=%d, window=%d\n",
-           g_dev_count, g_group_n, AGTR_ARRAY_SIZE, WINDOW);
+    printf("[router] opened %d ports, group_n=%d, agtr_slots=%d, window=%d, block_npkts=%d\n",
+           g_dev_count, g_group_n, AGTR_ARRAY_SIZE, WINDOW, BLOCK_NPKTS);
     fflush(stdout);
 }
 
@@ -145,6 +161,7 @@ static uint8_t router_ecn_mark(void) {
 static void broadcast_slot(uint32_t seq) {
     agtr_t *a = &g_agtr[seq % AGTR_ARRAY_SIZE];
     uint8_t frame[HDR_LEN + PAYLOAD_LEN];
+    uint16_t block_id = block_id_of_seq(seq);
     for (int dst_rank = 0; dst_rank < g_group_n; dst_rank++) {
         uint32_t dst_ip = g_cfg[dst_rank].host_ip;
         if (!g_drop_result_done && g_drop_result_dst == dst_rank && g_drop_result_seq == (int)seq) {
@@ -153,7 +170,7 @@ static void broadcast_slot(uint32_t seq) {
         }
         int len = build_frame_ex(frame, 0, dst_ip,
                                  (uint32_t)dst_rank, (uint32_t)dst_rank,
-                                 0, (uint16_t)count_bits32(neighbor_mask_of((uint32_t)dst_rank)),
+                                 block_id, (uint16_t)count_bits32(neighbor_mask_of((uint32_t)dst_rank)),
                                  seq, 0, 0, 0,
                                  a->payload, PAYLOAD_LEN);
         ((mtp_header_t *)(frame + sizeof(eth_header_t) + sizeof(ip_header_t)))->ecn = router_ecn_mark();
@@ -184,7 +201,20 @@ void INC(void) {
         int ip_ihl = (ip->version_ihl & 0x0f) * 4;
         mtp_header_t *mtp = (mtp_header_t *)(pk.data + sizeof(eth_header_t) + ip_ihl);
         int32_t *payload = (int32_t *)(pk.data + sizeof(eth_header_t) + ip_ihl + sizeof(mtp_header_t));
+        uint16_t block_id = ntohs(mtp->block_id);
 
+        if (mtp->is_ack == 1 && mtp->is_fetch == 1) {
+            uint32_t src_id = ntohl(mtp->src_id);
+            if (ip->src_ip != 0 && block_id == g_current_block && src_id < 32) {
+                g_block_done_bitmap |= (1u << src_id);
+                if (g_block_done_bitmap == full_mask) {
+                    g_current_block++;
+                    g_block_done_bitmap = 0;
+                    broadcast_block_release(g_current_block);
+                }
+            }
+            continue;
+        }
         if (mtp->is_ack == 1) {
             mtp->ecn = router_ecn_mark();
             router_forward(pk.data, pk.len, ip->dst_ip);
@@ -197,7 +227,7 @@ void INC(void) {
             router_forward(pk.data, pk.len, ip->dst_ip);
             continue;
         }
-        if (ntohs(mtp->block_id) != 0) continue;
+        if (block_id != g_current_block) continue;
 
         uint32_t src_id = ntohl(mtp->src_id);
         uint32_t dst_id = ntohl(mtp->dst_id);

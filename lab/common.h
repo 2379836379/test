@@ -14,6 +14,7 @@
 #define MAX_CONNS      8
 
 #define WINDOW        32
+#define BLOCK_NPKTS   WINDOW
 #define RTO_US        50000
 #define AGTR_ARRAY_SIZE (2 * WINDOW)
 
@@ -132,6 +133,10 @@ void common_set_group(config_entry_t *cfgs, int n);
 int rank_of_ip(uint32_t ip);
 int count_bits32(uint32_t x);
 uint32_t neighbor_mask_of(uint32_t vertex_id);
+uint16_t block_id_of_seq(uint32_t seq);
+uint32_t block_start_seq(uint16_t block_id);
+uint32_t block_end_seq(uint16_t block_id, uint32_t total_npkts);
+uint16_t total_blocks_for_npkts(uint32_t total_npkts);
 int build_frame_ex(uint8_t *buf,
                    uint32_t src_ip, uint32_t dst_ip,
                    uint32_t src_id, uint32_t dst_id,

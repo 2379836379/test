@@ -15,7 +15,6 @@ uint64_t now_us(void) {
     return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
 }
 
-/* 标准 Internet 校验和（16 位反码求和） */
 static uint16_t ip_checksum(const void *data, int len) {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
@@ -29,7 +28,6 @@ static uint16_t ip_checksum(const void *data, int len) {
     return (uint16_t)(~sum & 0xffff);
 }
 
-/* 组装一帧 MTP 报文到 buf，返回总长度。 */
 int build_frame_ex(uint8_t *buf,
                    uint32_t src_ip, uint32_t dst_ip,
                    uint32_t src_id, uint32_t dst_id,
@@ -78,9 +76,6 @@ static uint32_t default_neighbor_mask(int rank) {
     return mask;
 }
 
-/* 统计 bitmask 中 1 的个数。
- * 这里主要把“邻居集合”转换成论文里需要的 contributor count，
- * 供发送端填写 count 字段、交换机校验期望贡献数时复用。 */
 int count_bits32(uint32_t x) {
     int n = 0;
     while (x) {
@@ -101,18 +96,28 @@ uint32_t neighbor_mask_of(uint32_t vertex_id) {
     return g_neighbor_masks[vertex_id];
 }
 
-/* 默认把图看成全连接。
- * 如果没有提供 graph.cfg，就退化为“除自己外所有 rank 都是邻居”，
- * 这样最小实验环境可以直接运行，不依赖额外图配置。 */
+uint16_t block_id_of_seq(uint32_t seq) {
+    return (uint16_t)(seq / BLOCK_NPKTS);
+}
+
+uint32_t block_start_seq(uint16_t block_id) {
+    return (uint32_t)block_id * BLOCK_NPKTS;
+}
+
+uint32_t block_end_seq(uint16_t block_id, uint32_t total_npkts) {
+    uint32_t end = block_start_seq(block_id) + BLOCK_NPKTS;
+    return end > total_npkts ? total_npkts : end;
+}
+
+uint16_t total_blocks_for_npkts(uint32_t total_npkts) {
+    return (uint16_t)((total_npkts + BLOCK_NPKTS - 1) / BLOCK_NPKTS);
+}
+
 static void init_default_neighbor_masks(void) {
     for (int r = 0; r < g_n; r++)
         g_neighbor_masks[r] = default_neighbor_mask(r);
 }
 
-/* 从 graph.cfg 加载显式邻接关系。
- * 文件格式为：vertex,nbr1,nbr2,...
- * 读取后会覆盖默认全连接配置，使 ACK 目标、fetch 缺失集合、
- * 交换机期望贡献数三者都严格以这份图为准。 */
 static void try_load_neighbor_masks(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return;
