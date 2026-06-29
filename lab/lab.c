@@ -147,6 +147,9 @@ static uint32_t default_neighbor_mask(int rank) {
     return mask;
 }
 
+/* 统计 bitmask 中 1 的个数。
+ * 这里主要把“邻居集合”转换成论文里需要的 contributor count，
+ * 供发送端填写 count 字段、交换机校验期望贡献数时复用。 */
 static int count_bits32(uint32_t x) {
     int n = 0;
     while (x) {
@@ -161,11 +164,18 @@ static uint32_t neighbor_mask_of(uint32_t vertex_id) {
     return g_neighbor_masks[vertex_id];
 }
 
+/* 默认把图看成全连接。
+ * 如果没有提供 graph.cfg，就退化为“除自己外所有 rank 都是邻居”，
+ * 这样最小实验环境可以直接运行，不依赖额外图配置。 */
 static void init_default_neighbor_masks(void) {
     for (int r = 0; r < g_n; r++)
         g_neighbor_masks[r] = default_neighbor_mask(r);
 }
 
+/* 从 graph.cfg 加载显式邻接关系。
+ * 文件格式为：vertex,nbr1,nbr2,...
+ * 读取后会覆盖默认全连接配置，使 ACK 目标、fetch 缺失集合、
+ * 交换机期望贡献数三者都严格以这份图为准。 */
 static void try_load_neighbor_masks(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return;
@@ -273,6 +283,9 @@ static const uint8_t *g_local_src_buf = NULL;
 static uint32_t g_local_src_npkts = 0;
 static uint8_t g_local_src_op = 0;
 
+/* 记录本地主顶点的原始输入特征。
+ * 当别的 worker 超时后向我发 fetch，请求某个 seq 的原始特征时，
+ * 回复数据就直接从这块 source buffer 切片读取，而不是从聚合结果里反推。 */
 void register_local_source(const void *buf, uint32_t size, uint8_t op) {
     g_local_src_buf = (const uint8_t *)buf;
     g_local_src_npkts = size / PAYLOAD_LEN;
@@ -788,6 +801,9 @@ static int           g_drop_result_dst = -1;
 static int           g_drop_result_seq = -1;
 static int           g_drop_result_done = 0;
 
+/* 测试注入点：指定丢掉一份交换机结果包，强制主机走 fetch 恢复路径。
+ * 环境变量格式为 dst:seq，例如 2:5 表示丢给 rank2 的第 5 个结果分片。
+ * 只丢一次，避免测试环境进入永久缺包。 */
 static void init_fetch_test_fault(void) {
     const char *spec = getenv("FETCH_TEST_DROP_RESULT");
     int dst = -1;
@@ -905,6 +921,9 @@ static int dev_pop(dev_pkt_t *out) {
 }
 
 
+/* 用交换机入口共享环形缓冲的占用率近似论文里的拥塞信号。
+ * 当待处理包数量超过阈值时，对当前转发/广播的数据包打 ECN 标记，
+ * 主机收到后只回退对应 sender/vertex 的发送节奏。 */
 static uint8_t router_ecn_mark(void) {
     uint8_t ecn = 0;
     pthread_mutex_lock(&g_dev_buf.lock);
@@ -951,11 +970,7 @@ static void clear_slot(uint32_t gen) {
 }
 
 
-/*------------- 在网计算路由器：转发 + 聚合（待补全）------------- */
-/* 交换机聚合主循环：
- * - ACK / fetch 控制包直接 bypass；
- * - 普通数据包按 seq 映射到 aggregator slot 做按元素累加；
- * - 重传包若 slot 已完成，则直接重发结果而不是再次累加。 */
+/*------------- 在网计算路由器 ------------- */
 void INC(void) {
     printf("[router] running as INC (forward + aggregate)\n");
     fflush(stdout);
@@ -976,16 +991,6 @@ void INC(void) {
         /* 载荷指针（数据分组载荷恒为 PAYLOAD_LEN）： */
         int32_t *payload = (int32_t *)(pk.data + sizeof(eth_header_t) + ip_ihl + sizeof(mtp_header_t));
 
-        /***********************
-         * start of your code
-         *
-         * Single-block simplified INC:
-         *  1. ACK packets bypass aggregation and are forwarded directly.
-         *  2. Data packets must belong to block 0.
-         *  3. Contributor rank is derived from src_id (rank == vertex id in the simplified graph).
-         *  4. count is expected to be g_group_n - 1 for the fully connected graph.
-         *  5. One payload per rank is accumulated into the slot indexed by transport seq.
-         **********************/
         /* ACK 从不进入聚合器，直接旁路转发。 */
         if (mtp->is_ack == 1) {
             mtp->ecn = router_ecn_mark();
@@ -996,8 +1001,6 @@ void INC(void) {
          * 若它带 payload，说明这是 pull 回来的原始特征包；按照论文语义，
          * 这时该 seq 对应的 aggregator 已不再需要，立即释放槽位。 */
         if (mtp->is_fetch == 1) {
-            /* Paper semantics: pulled feature packets bypass aggregation and release the
-             * corresponding completed aggregator slot when they arrive at the switch. */
             if (ntohs(ip->total_len) > (uint16_t)(ip_ihl + sizeof(mtp_header_t)))
                 clear_slot(ntohs(ip->id));
             mtp->ecn = router_ecn_mark();
