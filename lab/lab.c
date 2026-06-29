@@ -12,26 +12,6 @@
 #define CC_GAP_MAX_US 2000
 
 /*======================================================================
- *  实验七：在网计算  —— 学生模板
- *
- *  下面带有
- *      start of your code  ...  end of your code
- *  标记的函数体需要你来补全。其余部分（libpcap 收发、接收缓冲区、各类
- *  初始化、转发表/聚合器数据结构、辅助函数）已经给出，可直接使用：
- *
- *    辅助/IO（已给）：
- *      now_us()                                  取当前时间(微秒)
- *      build_frame(...)                          组装一帧 MTP 报文
- *      conn_send(cn, seq, ack_flag, op, buf, n)  在某连接上发一个分组
- *      conn_pop(cn, &msg)                        从某连接接收缓冲区取一个分组(非阻塞)
- *      router_forward(frame, len, dst_ip)        路由器按目的 IP 转发一帧
- *      dev_pop(&pk)                              路由器从共享缓冲区取一帧(非阻塞)
- *      broadcast_slot(seq)                       路由器把某聚合完成的 slot 广播给所有连接
- *
- *  完整正确实现见 ../answer/lab.c（仅供对照，请独立完成）。
- *====================================================================*/
-
-/*======================================================================
  *  通用工具（已给）
  *====================================================================*/
 
@@ -139,6 +119,7 @@ static uint32_t       g_my_ip = 0;
 static pcap_t        *g_host_handle = NULL;
 
 /* 简化图模型：4 个顶点全连接，rank 就是 vertex id。 */
+// ip转化成rank
 static int rank_of_ip(uint32_t ip) {
     for (int i = 0; i < g_n; i++)
         if (g_cfg[i].host_ip == ip) return g_cfg[i].rank;
@@ -154,6 +135,9 @@ static pthread_mutex_t g_tx_lock = PTHREAD_MUTEX_INITIALIZER;
 //    - lock：保护这条连接队列的锁
 static conn_t         g_conns[MAX_CONNS];
 static int            g_conn_count = 0;
+/* 邻接表压缩为 bitmask：第 r 位为 1 表示当前 vertex 需要与 rank r 交互。
+ * 在当前 AGENT 约束下图是 4 点全连接，但这里仍保留显式邻接表，
+ * 这样 ACK 目标、邻居计数、fetch 缺失判定都统一来自同一份图信息。 */
 static uint32_t       g_neighbor_masks[MAX_GROUP_SIZE];
 
 static uint32_t default_neighbor_mask(int rank) {
@@ -205,7 +189,7 @@ static void try_load_neighbor_masks(const char *path) {
     }
     fclose(fp);
 }
-
+//按对端 remote_ip 找到对应 conn_t
 static conn_t *find_conn_by_remote(uint32_t remote_ip) {
     for (int i = 0; i < g_conn_count; i++) {
         if (!g_conns[i].in_use) continue;
@@ -215,6 +199,9 @@ static conn_t *find_conn_by_remote(uint32_t remote_ip) {
     return NULL;
 }
 
+/* 发送侧按“本地顶点”维护状态。
+ * 当前模型里每个 worker 只有一个顶点，因此 vertex_id == g_rank；
+ * 但这里仍按 vertex 粒度建模，便于 ACK / ECN / 完成判定保持论文语义。 */
 typedef struct {
     int active;
     const uint8_t *buf;
@@ -229,6 +216,9 @@ typedef struct {
     uint32_t gap_us;
 } send_vertex_state_t;
 
+/* 接收侧按“目标顶点”维护状态。
+ * reception bitmap 记录该顶点来自哪些邻居的特征已经完整可用；
+ * 在收到 switch 完整聚合结果时会直接完成，在 fetch 恢复路径中则逐邻居补齐。 */
 typedef struct {
     int active;
     uint32_t vertex_id;
@@ -260,6 +250,8 @@ static void mark_sender_ecn(uint32_t vertex_id) {
         sv->ecn_pending = 1;
 }
 
+/* 向该 vertex 的所有远端邻居发送 ACK。
+ * ACK 的含义不是“某个 seq 已收到”，而是“这个顶点在当前 block 已完成”。 */
 static void send_ack_to_neighbors(uint32_t vertex_id, uint16_t block_id, uint8_t op) {
     (void)op;
     uint32_t nbr_mask = neighbor_mask_of(vertex_id);
@@ -295,6 +287,8 @@ void clear_local_source(void) {
 
 /* 经 pcap 发送一帧（多线程发送加锁）。已给。 */
 // 发到router对端
+/* 所有主机侧发包最终都会走这里。
+ * pcap 句柄不是线程安全资源，因此发送路径统一加锁。 */
 static void host_inject(uint8_t *frame, int len) {
     pthread_mutex_lock(&g_tx_lock);
     pcap_inject(g_host_handle, frame, len);
@@ -327,6 +321,8 @@ static void conn_send(conn_t *cn, uint32_t seq, uint8_t ack_flag, uint8_t op,
 
 /* 后台接收线程：抓本机网卡进入的帧，按 conn_id 分发到对应连接的接收缓冲区。已给。 */
 // 主机内部的分发
+/* 主机收包线程负责把网卡上的 MTP 报文分发到本地连接队列。
+ * 这里不做协议语义判断，只做“按 local_ip/remote_ip 归入哪条 conn”。 */
 static void *host_rx_thread(void *arg) {
     (void)arg;
     struct pcap_pkthdr *hdr;
@@ -457,6 +453,10 @@ int init_conn(uint16_t conn_id, uint32_t local_ip, uint32_t remote_ip) {
 /*------------- 可靠传输：发送端（待补全）-------------
  * 固定窗口 + 超时重传 + 独立 ACK（选择重传），初始序列号为 0。
  * 假设 size 是 PAYLOAD_LEN 的整数倍，故每个分组都是满载荷 PAYLOAD_LEN。 */
+/* 发送侧可靠传输：
+ * 1. 仍以 seq 作为真正的数据分片发送窗口单位；
+ * 2. ACK/ECN/完成状态则按 vertex 维护，保持论文里的 per-vertex 语义；
+ * 3. 发送结束条件是“所有 seq 发完且该顶点邻居 ACK 收齐”。 */
 int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
     if (conn < 0 || conn >= g_conn_count) return -1;
     conn_t *cn = &g_conns[conn];
@@ -559,6 +559,11 @@ int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
 /*------------- 可靠传输：接收端（待补全）-------------
  * 假设 size 是 PAYLOAD_LEN 的整数倍，故每个数据分组都是满载荷 PAYLOAD_LEN。
  * 当前实现里，可靠传输序号来自本地解析出的 seq_num，而不是论文头字段 count。 */
+/* 接收侧同时处理三类路径：
+ * 1. switch 返回的完整聚合结果；
+ * 2. fetch 请求（空载荷控制包）；
+ * 3. fetch 回包（带 payload 的 bypass 特征包）。
+ * 对应论文里的“complete aggregation result / non-aggregated feature / timeout pull”。 */
 int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
     if (conn < 0 || conn >= g_conn_count) return -1;
 
@@ -616,6 +621,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                 saw_pkt = 1;
                 if (m.ecn)
                     mark_sender_ecn(m.dst_id);
+                /* ACK 只更新发送侧的 per-vertex 邻居确认位图，不直接推进 seq。
+                 * 真正的 seq 发送进度仍由结果数据包推进，避免 ACK 与窗口耦合。 */
                 if (m.is_ack == 1) {
                     send_vertex_state_t *sv = send_state_of(m.dst_id);
                     if (sv && sv->active &&
@@ -626,6 +633,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                     continue;
                 }
 
+                /* 收到 fetch 请求：对方缺少我这个顶点在某个 seq 上的原始特征，
+                 * 直接把本地源数据按 bypass 形式回给它。 */
                 if (m.is_fetch == 1 && m.payload_len == 0) {
                     if (g_local_src_buf && g_local_src_op == op && m.seq_num < g_local_src_npkts)
                         conn_send_ex(&g_conns[ci], m.seq_num, 0, op, 1, 1,
@@ -645,6 +654,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
                         sv->seq_acked[m.seq_num] = 1;
                 }
 
+                /* fetch 回包属于“未在交换机聚合的原始邻居特征”。
+                 * 先进入本地 cache，再参与 host 端补聚合，避免重复 fetch 时重复拷贝。 */
                 if (is_non_aggregated_feature) {
                     size_t cache_slot = (size_t)m.src_id * npkts + m.seq_num;
                     if (m.src_id < MAX_GROUP_SIZE && !feature_cached[cache_slot]) {
@@ -697,6 +708,8 @@ int m_recv(int conn, void *buf, uint32_t size, uint8_t op) {
         }
 
         uint64_t now = now_us();
+        /* 只有在还没拿到 switch 完整结果时，timeout 才触发 fetch。
+         * 缺失邻居集合直接由 reception bitmap 推出：missing = neighbor_mask - recv_bitmap。 */
         if (op == OP_ALLREDUCE && got < npkts && rv && !rv->switch_result_seen &&
             now - last_progress >= RTO_US && now - last_fetch_at >= RTO_US) {
             uint32_t missing_neighbors = rv->neighbor_mask & ~rv->neighbor_recv_bitmap;
@@ -812,6 +825,7 @@ static void *dev_capture_thread(void *arg) {
 }
 
 /* 按目的 IP 查转发表，从对应端口注入该帧。已给。 */
+/* 路由器侧的“转发”只按目的 IP 查出口端口，不理解更高层语义。 */
 static void router_forward(const uint8_t *frame, int len, uint32_t dst_ip) {
     const char *out_port = NULL;
     for (int i = 0; i < g_route_count; i++)
@@ -903,6 +917,9 @@ static uint8_t router_ecn_mark(void) {
 }
 
 /* 把某个已聚合完成的 slot 广播给所有连接（取模寻址）。已给。 */
+/* 把某个已经聚合完成的 slot 广播给所有 host。
+ * 在当前简化模型里，每个 host 都需要知道这个顶点对应的聚合结果，
+ * 因而结果包直接 fanout 到所有 worker。 */
 static void broadcast_slot(uint32_t seq) {
     agtr_t *a = &g_agtr[seq % AGTR_ARRAY_SIZE];
     uint8_t frame[HDR_LEN + PAYLOAD_LEN];
@@ -925,6 +942,8 @@ static void broadcast_slot(uint32_t seq) {
 }
 
 /* 聚合器复用：清空“一个窗口外”的 slot（gen 仅用于定位物理 slot）。已给。 */
+/* 清空聚合槽位。
+ * slot 数量只有 2 * WINDOW，因此旧 seq 的状态必须及时复用，否则会污染后续分片。 */
 static void clear_slot(uint32_t gen) {
     agtr_t *a = &g_agtr[gen % AGTR_ARRAY_SIZE];
     a->bitmap = 0;
@@ -933,6 +952,10 @@ static void clear_slot(uint32_t gen) {
 
 
 /*------------- 在网计算路由器：转发 + 聚合（待补全）------------- */
+/* 交换机聚合主循环：
+ * - ACK / fetch 控制包直接 bypass；
+ * - 普通数据包按 seq 映射到 aggregator slot 做按元素累加；
+ * - 重传包若 slot 已完成，则直接重发结果而不是再次累加。 */
 void INC(void) {
     printf("[router] running as INC (forward + aggregate)\n");
     fflush(stdout);
@@ -963,11 +986,15 @@ void INC(void) {
          *  4. count is expected to be g_group_n - 1 for the fully connected graph.
          *  5. One payload per rank is accumulated into the slot indexed by transport seq.
          **********************/
+        /* ACK 从不进入聚合器，直接旁路转发。 */
         if (mtp->is_ack == 1) {
             mtp->ecn = router_ecn_mark();
             router_forward(pk.data, pk.len, ip->dst_ip);
             continue;
         }
+        /* fetch 包同样旁路。
+         * 若它带 payload，说明这是 pull 回来的原始特征包；按照论文语义，
+         * 这时该 seq 对应的 aggregator 已不再需要，立即释放槽位。 */
         if (mtp->is_fetch == 1) {
             /* Paper semantics: pulled feature packets bypass aggregation and release the
              * corresponding completed aggregator slot when they arrive at the switch. */
@@ -994,6 +1021,8 @@ void INC(void) {
         agtr_t *a = &g_agtr[seq % AGTR_ARRAY_SIZE];
         uint32_t bit = 1u << k;
 
+        /* 首次看到该 src_id 对当前 seq 的贡献时才真正累加。
+         * bitmap 防止重传或重复包导致交换机二次加和。 */
         if ((a->bitmap & bit) == 0) {
             for (int i = 0; i < PAYLOAD_LEN / (int)sizeof(int32_t); i++)
                 a->payload[i] += payload[i];
@@ -1004,6 +1033,7 @@ void INC(void) {
             continue;
         }
 
+        /* 只有所有预期贡献都到齐，slot 才算完成并触发结果广播。 */
         if (a->bitmap != full_mask) continue;
 
         clear_slot(seq + WINDOW);

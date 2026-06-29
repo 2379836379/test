@@ -66,6 +66,31 @@ static int my_rank_of(const char *name) {
     return -1;
 }
 
+static int pick_data_uplink_rank(int rank) {
+    for (int r = 0; r < n; r++) {
+        if (r != rank) return r;
+    }
+    return -1;
+}
+
+static int init_host_conns_for_allreduce(int rank, int *data_conn, int *recv_conn) {
+    int uplink_rank = pick_data_uplink_rank(rank);
+    if (uplink_rank < 0) return -1;
+
+    *data_conn = init_conn((uint16_t)uplink_rank, ip_of_rank(rank), ip_of_rank(uplink_rank));
+    if (*data_conn < 0) return -1;
+
+    for (int r = 0; r < n; r++) {
+        if (r == rank || r == uplink_rank) continue;
+        if (init_conn((uint16_t)r, ip_of_rank(rank), ip_of_rank(r)) < 0)
+            return -1;
+    }
+
+    *recv_conn = init_conn(0xffffu, ip_of_rank(rank), 0);
+    if (*recv_conn < 0) return -1;
+    return 0;
+}
+
 static void read_input(int rank, int32_t *buf, uint32_t maxints) {
     char fn[64];
     snprintf(fn, sizeof(fn), "input-%d.data", rank);
@@ -128,26 +153,13 @@ int main(int argc, char *argv[]) {
     }
     read_input(rank, src, nints);
 
-    int succ = (rank + 1) % n;
-
-    int send_conn = init_conn((uint16_t)rank, ip_of_rank(rank), ip_of_rank(succ));
-    if (send_conn < 0) {
-        fprintf(stderr, "init_conn failed\n");
-        free(src);
-        free(dst);
-        return 1;
-    }
-    for (int r = 0; r < n; r++) {
-        if (r == rank || r == succ) continue;
-        if (init_conn((uint16_t)r, ip_of_rank(rank), ip_of_rank(r)) < 0) {
-            fprintf(stderr, "init_conn failed\n");
-            free(src);
-            free(dst);
-            return 1;
-        }
-    }
-    int recv_conn = init_conn(0xffffu, ip_of_rank(rank), 0);
-    if (recv_conn < 0) {
+    /* Current lab protocol uses three logical connection classes:
+     * 1. one data uplink used for vertex feature uploads to the switch path;
+     * 2. peer control connections used for ACK/fetch host-to-host control traffic;
+     * 3. one router-result connection matching aggregated packets with remote_ip == 0. */
+    int data_conn = -1;
+    int recv_conn = -1;
+    if (init_host_conns_for_allreduce(rank, &data_conn, &recv_conn) < 0) {
         fprintf(stderr, "init_conn failed\n");
         free(src);
         free(dst);
@@ -157,7 +169,7 @@ int main(int argc, char *argv[]) {
     register_local_source(src, MSG_SIZE, OP_ALLREDUCE);
 
     send_args_t sa = {
-        .conn = send_conn,
+        .conn = data_conn,
         .buf = src,
         .size = MSG_SIZE,
         .op = OP_ALLREDUCE,

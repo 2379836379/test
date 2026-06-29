@@ -54,7 +54,7 @@ typedef struct {
 } __attribute__((packed)) mtp_header_t;
 
 #define HDR_LEN (sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(mtp_header_t))
-
+// worker
 typedef struct {
     int      rank;
     char     host_name[32];
